@@ -48,6 +48,8 @@ def init_db() -> None:
         defaults = {
             "recording_dir": str(data_dir() / "Recordings"), "max_recordings": "4",
             "retry_seconds": "10", "monitor_seconds": "30", "low_disk_gb": "5", "segment_minutes": "0",
+            "timeshift_buffer_minutes": "60", "timeshift_max_storage_gb": "4",
+            "timeshift_min_free_gb": "5", "preview_transcode": "true",
         }
         db.executemany("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", defaults.items())
 

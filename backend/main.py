@@ -21,6 +21,7 @@ from .models import SettingsInput, StreamInput
 from .preview_manager import PreviewManager
 from .streamlink_engine import StreamAccessError, inspect
 from .system_monitor import snapshot as system_snapshot
+from .timeshift_manager import TimeShiftManager
 
 
 class Hub:
@@ -40,11 +41,13 @@ class Hub:
 hub = Hub()
 recorders: dict[int, Recorder] = {}
 previews = PreviewManager()
+timeshifts = TimeShiftManager()
 monitor_status: dict[int, dict] = {}
 
 
 async def background_updates():
     last_monitor = 0.0
+    last_storage_check = 0.0
     while True:
         now = time.monotonic()
         for rid, recorder in list(recorders.items()):
@@ -62,6 +65,9 @@ async def background_updates():
                         stream_sessions.pop(state["stream_id"], None)
                 await hub.publish("recording-finished", state)
         await hub.publish("system", system_snapshot())
+        if now - last_storage_check >= 5:
+            last_storage_check = now
+            await asyncio.to_thread(timeshifts.enforce_limits)
         if now - last_monitor >= max(10, int(settings().get("monitor_seconds", "30"))):
             last_monitor = now
             for stream in rows("SELECT * FROM streams WHERE monitor=1"):
@@ -118,10 +124,13 @@ def recover_interrupted_recordings():
 async def lifespan(application: FastAPI):
     init_db()
     recover_interrupted_recordings()
-    preview_dir = data_dir() / "previews"
-    for temporary in preview_dir.iterdir():
+    media_dir = data_dir() / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    for temporary in media_dir.iterdir():
         if temporary.is_dir(): shutil.rmtree(temporary, ignore_errors=True)
         else: temporary.unlink(missing_ok=True)
+    (media_dir / "previews").mkdir(exist_ok=True)
+    (media_dir / "timeshift").mkdir(exist_ok=True)
     application.state.loop = asyncio.get_running_loop()
     updater = asyncio.create_task(background_updates())
     log("info", "StreamX backend started")
@@ -129,6 +138,7 @@ async def lifespan(application: FastAPI):
     updater.cancel()
     for item in recorders.values(): item.stop()
     previews.shutdown()
+    timeshifts.shutdown()
     await asyncio.gather(updater, return_exceptions=True)
     # Give FFmpeg time to close containers and write their final indexes.
     await asyncio.to_thread(lambda: [r.thread.join(timeout=35) for r in list(recorders.values())])
@@ -149,8 +159,17 @@ async def authenticate_local_client(request, call_next):
         if not hmac.compare_digest(supplied, expected):
             return JSONResponse(status_code=401, content={"detail": "Desktop client authentication failed."})
     return await call_next(request)
-(data_dir() / "previews").mkdir(exist_ok=True)
-app.mount("/media", StaticFiles(directory=data_dir() / "previews"), name="media")
+
+
+@app.middleware("http")
+async def media_cache_policy(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/media/") and request.url.path.endswith(".m3u8"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    return response
+(data_dir() / "media" / "previews").mkdir(parents=True, exist_ok=True)
+(data_dir() / "media" / "timeshift").mkdir(parents=True, exist_ok=True)
+app.mount("/media", StaticFiles(directory=data_dir() / "media"), name="media")
 
 
 def active_for(stream_id: int) -> Recorder | None:
@@ -168,6 +187,7 @@ def stream_details(stream: dict) -> dict:
     data["session"] = rec.snapshot() if rec else None
     data["availability"] = monitor_status.get(stream["id"], {"state": "unknown", "qualities": [], "error": None})
     data["preview"] = previews.snapshot().get(str(stream["id"]))
+    data["timeshift"] = timeshifts.get(str(stream["id"]))
     return data
 
 
@@ -215,6 +235,7 @@ def update_stream(stream_id: int, payload: StreamInput):
 def delete_stream(stream_id: int):
     if active_for(stream_id): raise HTTPException(409, "Stop the active recording before removing this stream.")
     previews.stop(str(stream_id))
+    timeshifts.stop(str(stream_id))
     execute("DELETE FROM streams WHERE id=?", (stream_id,))
     return {"ok": True}
 
@@ -291,6 +312,23 @@ def preview_start(stream_id: int):
 @app.delete("/api/streams/{stream_id}/preview")
 def preview_stop(stream_id: int):
     previews.stop(str(stream_id)); return {"ok": True}
+
+
+@app.post("/api/streams/{stream_id}/timeshift")
+def timeshift_start(stream_id: int):
+    stream = row("SELECT * FROM streams WHERE id=?", (stream_id,))
+    if not stream: raise HTTPException(404, "Stream not found.")
+    try:
+        item = timeshifts.start(stream)
+    except OSError as exc:
+        raise HTTPException(507, str(exc)) from exc
+    return item.snapshot()
+
+
+@app.delete("/api/streams/{stream_id}/timeshift")
+def timeshift_stop(stream_id: int):
+    timeshifts.stop(str(stream_id))
+    return {"ok": True}
 
 
 @app.get("/api/recordings")

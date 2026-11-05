@@ -20,3 +20,7 @@ class SettingsInput(BaseModel):
     monitor_seconds: int | None = Field(default=None, ge=10, le=3600)
     low_disk_gb: int | None = Field(default=None, ge=0, le=1000)
     segment_minutes: int | None = Field(default=None, ge=0, le=1440)
+    timeshift_buffer_minutes: int | None = Field(default=None, ge=5, le=1440)
+    timeshift_max_storage_gb: int | None = Field(default=None, ge=1, le=512)
+    timeshift_min_free_gb: int | None = Field(default=None, ge=0, le=1000)
+    preview_transcode: bool | None = None
